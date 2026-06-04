@@ -1,6 +1,7 @@
 from transformers import PretrainedConfig
 
 
+# 主要是和huggingface有关的一些
 class MokioMindConfig(PretrainedConfig):
     model_type = "mokiomind"
 
@@ -70,3 +71,33 @@ class MokioMindConfig(PretrainedConfig):
             if self.inference_rope_scaling
             else None
         )
+
+
+import torch
+import torch.nn as nn
+
+
+# 编写RMSNorm
+# 这是一个层，需要继承自nn.Module(且强制要求实现前向传播方法)
+# self的知识: 只要在类里面其他类里面用变量，就要加self（存在self上的，是成员变量；不加self的，是局部变量）
+class RMSNorm(nn.Module):
+    #初始化
+    def __init__(self,dim:int,eps:float=1e-5):
+        super().__init__()
+        self.dim = dim
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+    
+    #RMSNorm 计算逻辑
+    def _norm(self,x):
+        return x*torch.rsqrt(x.pow(2).mean(-1,keepdim = True)+self.eps) #在最后一个维度求均值。[batch_size,seq_len,hidden_size]
+    
+    #前向传播
+    def forward(self,x):
+        return self.weight*self._norm(x.float()).type_as(x) #float() 和 type_as(x) 都是对x数据类型的操作，可能x本身是float16，那么就是中间先转换为float32，再转换为float16
+    
+
+    
+
+
+
