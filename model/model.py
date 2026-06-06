@@ -74,7 +74,14 @@ class MokioMindConfig(PretrainedConfig):
 
 
 import torch
+import math
 import torch.nn as nn
+from torch.nn import init
+from typing import Optional, Tuple, List, Union
+import torch.nn.functional as F
+from transformers.activations import ACT2FN
+from transformers import PreTrainedModel, GenerationMixin, PretrainedConfig
+from transformers.modeling_outputs import CausalLMOutputWithPast
 
 
 # 编写RMSNorm
@@ -94,10 +101,85 @@ class RMSNorm(nn.Module):
     
     #前向传播
     def forward(self,x):
-        return self.weight*self._norm(x.float()).type_as(x) #float() 和 type_as(x) 都是对x数据类型的操作，可能x本身是float16，那么就是中间先转换为float32，再转换为float16
+        return (self.weight*self._norm(x.float())).type_as(x) #float() 和 type_as(x) 都是对x数据类型的操作，可能x本身是float16，那么就是中间先转换为float32，再转换为float16
     
 
     
+#YaRN方法（rope_scaling:RoPE缩放配置）
+def precompute_freqs_cis(dim:int,end:int=int(32*1024),rope_base:float=1e6,rope_scaling:Optional[dict]=None):
+    # RoPE公式: freq = 1 / (base ^ (2i/d))  其中 i = 0, 1, ..., dim/2-1
+    # torch.arange(0,dim,2)     → 偶数维索引: [0,2,4,...,dim-2]
+    # [:(dim//2)]              → 取前 dim//2 个
+    # .float()/dim             → 算出指数: 2i/d
+    # rope_base ** (...)       → base^(2i/d)
+    # 1.0 / (...)              → 取倒数得到频率
+    # 结果: freqs 长度 dim/2, 每个元素是第 i 对维度的频率
+    # attn_factor: 对应YaRN论文中的t，在softmax里面一个额外的缩放因子，理论上应该根据上下文长度自动变化
+    freqs,attn_factor=(
+        1.0/(rope_base**(torch.arange(0,dim,2)[:(dim//2)].float()/dim)),
+        1.0)
+    
+    if rope_scaling is not None:
+        orig_max,factor,beta_fast,beta_slow,attn_factor = (
+            rope_scaling.get("original_max_position_embeddings", 2048), 
+            rope_scaling.get("factor", 16),# 上下文扩展倍数
+            rope_scaling.get("beta_fast", 32.0), 
+            rope_scaling.get("beta_slow", 1.0), 
+            rope_scaling.get("attention_factor", 1.0) #注意力缩放因子，等效于调整softmax温度
+        )
+
+        # 推断长度大于训练长度的时候，使用YaRN
+        if end > orig_max:
+            #先求划分高低维的i
+            inv_dim = lambda b: (dim*math.log(orig_max/(b*2*math.pi)))/(2*math.log(rope_base))
+            # 划分高低维度
+            # low低维：不需要缩放的高频部分
+            # high高维: 需要缩放的低频部分
+            low,high = (
+                max(math.floor(inv_dim(beta_fast)),0), #向下取整 
+                min(math.ceil(inv_dim(beta_slow)),dim//2-1) #向上取整
+            )
+
+            # 5. 计算混合因子 γ (Ramp)--对应平滑过度这一段
+            # 在 low 之前，ramp 为 0；在 high 之后，ramp 为 1；在 low 和 high 之间，线性过渡。
+            # clamp 函数限制了数值只能在 [0, 1] 之间。
+            ramp = torch.clamp((torch.arange(dim//2,device=freqs.device).float()-low)/max(high-low,0.001),0,1)
+            freqs = freqs*(1-ramp+ramp/factor) #[dim/2]
+        
+    t = torch.arange(0,end,device=freqs.device) #[end]
+    freqs = torch.outer(t,freqs).float() #[end,dim/2 ]
+    freqs_cos = torch.cat([torch.cos(freqs),torch.cos(freqs)],dim=-1)*attn_factor
+    freqs_sin = torch.cat([torch.sin(freqs),torch.sin(freqs)],dim=-1)*attn_factor
+    return freqs_cos,freqs_sin
+
+
+def apply_rotary_pos_emb(q,k,cos,sin,unsqueeze_dim=1):
+    def rotate_half(x):
+        return torch.cat((-x[...,x.shape[-1]//2:],x[...,:x.shape[-1]//2]),dim=-1)
+    q_embed = ((q*cos.unsqueeze(unsqueeze_dim))+(rotate_half(q)*sin.unsqueeze(unsqueeze_dim))).to(q.dtype)
+    k_embed = ((k*cos.unsqueeze(unsqueeze_dim))+(rotate_half(k)*sin.unsqueeze(unsqueeze_dim))).to(k.dtype)
+    return q_embed,k_embed
+
+
+
+            
+            
+
+
+
+
+
+
+
+
+
+
+
+
+    
+
+
+
 
 
 
