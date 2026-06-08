@@ -202,6 +202,7 @@ class Attention(nn.Module):
             if attention_mask is not None: #attention_mask=1 表示该位置是一个有效的token，不是占位符等
                 # attention_mask:[bsz,seq_len]->[bsz,1,1,seq_len]；要先unsqueeze，扩展维度，才能使用广播机制
                 # attention_mask 是一个attention_mask == 1) 全是1的矩阵，下面对应的意思是，无效的token会加上一个-1e9 （+负♾️）
+                # attention_mask =1: 非pading；=0:padding
                 scores += (1.0-attention_mask.unsqueeze(1).unsqueeze(2))*-1e9
             output = self.attn_dropout(F.softmax(scores.float(),dim=-1).type_as(xq))@xv
         output = output.transpose(1,2).reshape(bsz,seq_len,-1) # -1：[2,3,8,64]->[]2,3,512] 就是把其他的东西放在最后一个维度
@@ -209,4 +210,16 @@ class Attention(nn.Module):
         return output,past_kv 
         
         
-          
+class FeedForward(nn.Module):
+    def __init__(self,args:MiniMindConfig,intermediate_size:int = None):
+        # intermediate：up_proj 升维到这个中间维度
+        super().__init__()
+        intermediate_size = intermediate_size or args.intermediate_size
+        self.gate_proj = nn.Linear(args.hidden_size,intermediate_size,bias = False)
+        self.up_proj = nn.Linear(args.hidden_size,intermediate_size,bias = False)
+        self.down_proj = nn.Linear(intermediate_size,args.hidden_size,bias = False)        
+        self.act_fn = ACT2FN[args.hidden_act] #hidden_act: SiLU；ACT2FN：一个激活函数的包
+    def forward(self,x):
+        return self.down_proj(self.act_fn(self.gate_proj(x))*self.up_proj(x)) #这里其实还应该有dropout和残差连接部分
+
+
