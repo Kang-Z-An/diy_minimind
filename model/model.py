@@ -207,7 +207,7 @@ class Attention(nn.Module):
             output = self.attn_dropout(F.softmax(scores.float(),dim=-1).type_as(xq))@xv
         output = output.transpose(1,2).reshape(bsz,seq_len,-1) # -1：[2,3,8,64]->[]2,3,512] 就是把其他的东西放在最后一个维度
         output = self.resid_dropout(self.o_proj(output))
-        return output,past_kv 
+        return outpu t,past_kv 
         
         
 class FeedForward(nn.Module):
@@ -259,3 +259,25 @@ class MOEFeedForward(nn.Module):
 
 
         
+
+class MiniMindBlock(nn.Module):
+    #__init__部分用的参数就对应调用其他class的init的参数，forward的参数就对应调用的其他class的forward参数
+    def __init__(self,layer_id:int,config:MiniMindConfig):
+        super().__init__()
+        self.self_attn = Attention(config)
+        #两个LayerNorm分别是 Attention部分开始的归一化和 Attention之后，FeedForward部分的归一化
+        self.input_layernorm = RMSNorm(config.hidden_size,eps=config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(config.hidden_size,eps=config.rms_norm_eps)
+        self.mlp = FeedForward(config) if not config.use_moe else MOEFeedForward(config)
+    
+    def forward(self,hidden_states,position_embeddings,past_key_value = None,use_cache = False,attention_mask = None):
+        residual = hidden_states #这里是原始的输入，就是x
+        hidden_states,present_key_value = self.self_attn(self.input_layernorm(hidden_states),position_embeddings,
+                                                         past_key_value,use_cache,attention_mask)
+        hidden_states += residual 
+        hidden_states = hidden_states +self.mlp(self.post_attention_layernorm(hidden_states))
+        return hidden_states,present_key_value
+
+        
+
+
