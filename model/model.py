@@ -35,8 +35,8 @@ class MiniMindConfig(PretrainedConfig):
             "type": "yarn"
         } if self.inference_rope_scaling else None
         ### MoE specific configs (ignored if use_moe = False)
-        self.num_experts = kwargs.get("num_experts", 4)
-        self.num_experts_per_tok = kwargs.get("num_experts_per_tok", 1)
+        self.num_experts = kwargs.get("num_experts", 4) #一共有四个专家 
+        self.num_experts_per_tok = kwargs.get("num_experts_per_tok", 1) #每个token使用一个专家，就是前1个专家
         self.moe_intermediate_size = kwargs.get("moe_intermediate_size", self.intermediate_size)
         self.norm_topk_prob = kwargs.get("norm_topk_prob", True)
         self.router_aux_loss_coef = kwargs.get("router_aux_loss_coef", 5e-4)
@@ -223,3 +223,39 @@ class FeedForward(nn.Module):
         return self.down_proj(self.act_fn(self.gate_proj(x))*self.up_proj(x)) #这里其实还应该有dropout和残差连接部分
 
 
+
+class MOEFeedForward(nn.Module):
+    def __init__(self,config:MiniMindConfig):
+        super().__init__()
+        self.config = config
+        self.gate = nn.Linear(config.hidden_size,config.num_experts,bias = False) #[1,hidden_size]@[hidden_size,num_experts]->[1,num_experts]
+        self.experts = nn.ModuleList([FeedForward(config,intermediate_size=config.moe_intermediate_size) for _ in range(config.num_experts)])
+        self.act_fn = ACT2FN[config.hidden_act]
+    
+    def forward(self,x):
+        batch_size,seq_len,hidden_dim = x.shape #shape是属性，没有括号
+        x_flat = x.view(-1,hidden_dim) #展平操作；比如：[2,128,512] -> [256,512]
+        scores = F.softmax(self.gate(x_flat),dim=-1)
+        #topk_idx选择的是哪个专家
+        #topk_weight选择的专家的权重是多少
+        topk_weight,topk_idx = torch.topk(scores,k=self.config.num_experts_per_tok,dim=-1,sorted = False)
+        if self.config.norm_topk_prob:
+            topk_weight = topk_weight/(topk_weight.sum(dim=-1,keepdim = True)+1e-20) #挑选的专家中重新归一化(重归一化权重)
+        y = torch.zeros_like(x_flat)
+        for i,expert in enumerate(self.experts):
+            mask = (topk_idx == i)
+            if mask.any():
+                token_idx = mask.any(dim = -1).nonzero().flatten()
+                weight = topk_weight[mask].view(-1,1)
+                y.index_add_(0,token_idx,(expert(x_flat[token_idx])*weight).to(y.dtype)) #这里add后面的下划线 是原位修改
+            elif self.training:
+                y[0,0]+=0*sum(p.sum() for p in expert.parameters())
+        if self.training and self.config.router_aux_loss_coef>0:
+            load = F.one_hot(topk_idx,self.config.num_experts).float().mean(0)
+            self.aux_loss = (load*scores.mean(0)).sum()*self.config.num_experts*self.config.router_aux_loss_coef
+        else:
+            self.aux_loss = scores.new_zeros(1).squeeze()
+        return y.view(batch_size,seq_len,hidden_dim)
+
+
+        
